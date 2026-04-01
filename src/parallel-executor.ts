@@ -14,7 +14,6 @@ import { performSakeFinanceOperations } from './modules/sake-finance.js'
 import { performLiquidityManagement as performStargateLiquidity } from './modules/stargate.js'
 import { performDepositManagement } from './modules/untitled-bank.js'
 import { performRevoke } from './modules/revoke.js'
-import { performRedButtonNoob } from './modules/redbutton-noob.js'
 import { performHarkan } from './modules/harkan.js'
 import { performVelodrome } from './modules/velodrome.js'
 import { performWowmax } from './modules/wowmax.js'
@@ -169,11 +168,6 @@ export class ParallelExecutor {
       name: 'Revoke',
       description: 'Отзыв всех апрувов для кошелька',
       execute: performRevoke
-    },
-    {
-      name: 'RedButton Noob',
-      description: 'Выполнение 1-3 транзакций в режиме noob с задержкой 10-20 секунд',
-      execute: performRedButtonNoob
     },
     {
       name: 'Harkan',

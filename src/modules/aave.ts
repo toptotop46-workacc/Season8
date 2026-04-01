@@ -56,6 +56,27 @@ const ERC20_ABI = [
   }
 ] as const
 
+const AAVE_RESERVE_CONFIG_ABI = [
+  {
+    'inputs': [
+      { 'internalType': 'address', 'name': 'asset', 'type': 'address' }
+    ],
+    'name': 'getConfiguration',
+    'outputs': [
+      {
+        'components': [
+          { 'internalType': 'uint256', 'name': 'data', 'type': 'uint256' }
+        ],
+        'internalType': 'struct DataTypes.ReserveConfigurationMap',
+        'name': '',
+        'type': 'tuple'
+      }
+    ],
+    'stateMutability': 'view',
+    'type': 'function'
+  }
+] as const
+
 // ABI для L2PoolInstance контракта
 const L2_POOL_ABI = [
   {
@@ -139,6 +160,118 @@ const A_TOKEN_ABI = [
 
 // Создание публичного клиента с fallback RPC
 const publicClient = rpcManager.createPublicClient(soneiumChain)
+
+const AAVE_ACTIVE_BIT = 56n
+const AAVE_FROZEN_BIT = 57n
+const AAVE_PAUSED_BIT = 60n
+const AAVE_SUPPLY_CAP_SHIFT = 116n
+const AAVE_SUPPLY_CAP_MASK = (1n << 36n) - 1n
+
+export type AaveSupplyAvailabilityReason =
+  | 'available'
+  | 'inactive_reserve'
+  | 'reserve_frozen'
+  | 'reserve_paused'
+  | 'supply_cap_reached'
+  | 'unknown_unavailable'
+
+export type AaveSupplyAvailabilityPlan = {
+  status: 'available' | 'unavailable'
+  reason: AaveSupplyAvailabilityReason
+}
+
+export type AaveSupplyStatusSnapshot = {
+  isActive: boolean
+  isFrozen: boolean
+  isPaused: boolean
+  supplyCapUnits: bigint
+  totalSupplyUnits: bigint
+  requestedSupplyUnits: bigint
+}
+
+function isBitSet (value: bigint, bitPosition: bigint): boolean {
+  return ((value >> bitPosition) & 1n) === 1n
+}
+
+function decodeAaveSupplyCap (configData: bigint): bigint {
+  return (configData >> AAVE_SUPPLY_CAP_SHIFT) & AAVE_SUPPLY_CAP_MASK
+}
+
+function formatAaveSupplyReason (reason: AaveSupplyAvailabilityReason): string {
+  switch (reason) {
+  case 'inactive_reserve':
+    return 'reserve inactive'
+  case 'reserve_frozen':
+    return 'reserve frozen'
+  case 'reserve_paused':
+    return 'reserve paused'
+  case 'supply_cap_reached':
+    return 'supply cap reached'
+  case 'unknown_unavailable':
+    return 'unknown unavailable state'
+  default:
+    return 'available'
+  }
+}
+
+export function planAaveSupplyAvailability (snapshot: AaveSupplyStatusSnapshot): AaveSupplyAvailabilityPlan {
+  if (!snapshot.isActive) {
+    return { status: 'unavailable', reason: 'inactive_reserve' }
+  }
+
+  if (snapshot.isFrozen) {
+    return { status: 'unavailable', reason: 'reserve_frozen' }
+  }
+
+  if (snapshot.isPaused) {
+    return { status: 'unavailable', reason: 'reserve_paused' }
+  }
+
+  if (snapshot.supplyCapUnits > 0n) {
+    const projectedSupply = snapshot.totalSupplyUnits + snapshot.requestedSupplyUnits
+    if (projectedSupply > snapshot.supplyCapUnits) {
+      return { status: 'unavailable', reason: 'supply_cap_reached' }
+    }
+  }
+
+  return { status: 'available', reason: 'available' }
+}
+
+export async function getAaveSupplyAvailability (amount: string): Promise<AaveSupplyAvailabilityPlan> {
+  const [decimals, config, totalSupply] = await Promise.all([
+    publicClient.readContract({
+      address: USDC_E_TOKEN,
+      abi: ERC20_ABI,
+      functionName: 'decimals'
+    }),
+    publicClient.readContract({
+      address: L2_POOL_INSTANCE,
+      abi: AAVE_RESERVE_CONFIG_ABI,
+      functionName: 'getConfiguration',
+      args: [USDC_E_TOKEN]
+    }),
+    publicClient.readContract({
+      address: A_TOKEN_INSTANCE,
+      abi: A_TOKEN_ABI,
+      functionName: 'totalSupply'
+    })
+  ])
+
+  const configData = config.data
+  const requestedSupplyUnits = parseUnits(amount, decimals)
+  const reserveUnit = 10n ** BigInt(decimals)
+  const supplyCapTokens = decodeAaveSupplyCap(configData)
+  const supplyCapUnits = supplyCapTokens === 0n ? 0n : supplyCapTokens * reserveUnit
+
+  return planAaveSupplyAvailability({
+    isActive: isBitSet(configData, AAVE_ACTIVE_BIT),
+    isFrozen: isBitSet(configData, AAVE_FROZEN_BIT),
+    isPaused: isBitSet(configData, AAVE_PAUSED_BIT),
+    supplyCapUnits,
+    totalSupplyUnits: totalSupply,
+    requestedSupplyUnits
+  })
+}
 
 /**
  * Получает баланс USDC.e токена для указанного адреса
@@ -286,7 +419,7 @@ export async function approveUSDC (privateKey: `0x${string}`, amount: string): P
 
     if (receipt.status === 'success') {
       logger.operation('Approve для AAVE', 'success')
-      logger.transaction(hash, 'confirmed', 'AAVE', account.address)
+      logger.transaction(hash, 'confirmed', 'AAVE', account.address, 'APPROVE')
       await new Promise(resolve => setTimeout(resolve, 30000))
     } else {
       logger.operation('Approve для AAVE', 'error')
@@ -307,6 +440,11 @@ export async function addLiquidity (privateKey: `0x${string}`, amount: string): 
   try {
     const account = privateKeyToAccount(privateKey)
     const walletClient = rpcManager.createWalletClient(soneiumChain, account)
+
+    const supplyAvailability = await getAaveSupplyAvailability(amount)
+    if (supplyAvailability.status === 'unavailable') {
+      throw new Error(`Депозит в Aave сейчас недоступен: ${formatAaveSupplyReason(supplyAvailability.reason)}`)
+    }
 
     const decimals = await publicClient.readContract({
       address: USDC_E_TOKEN,
@@ -393,7 +531,7 @@ export async function addLiquidity (privateKey: `0x${string}`, amount: string): 
 
         if (receipt.status === 'success') {
           logger.operation(`Депозит ${amount} USDC.e в AAVE`, 'success')
-          logger.transaction(hash, 'confirmed', 'AAVE', account.address)
+          logger.transaction(hash, 'confirmed', 'AAVE', account.address, 'DEPOSIT')
           await new Promise(resolve => setTimeout(resolve, 30000))
           return hash
         } else {
@@ -535,7 +673,7 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
 
         if (receipt.status === 'success') {
           logger.operation(`Вывод ${withdrawAmount} USDC.e из AAVE`, 'success')
-          logger.transaction(hash, 'confirmed', 'AAVE', account.address)
+          logger.transaction(hash, 'confirmed', 'AAVE', account.address, 'WITHDRAW')
           await new Promise(resolve => setTimeout(resolve, 30000))
           return hash
         } else {
@@ -735,9 +873,86 @@ async function ensureUSDCForAave (privateKey: `0x${string}`, minAmount: string =
   }
 }
 
+type EnsureUSDCForAaveResult = Awaited<ReturnType<typeof ensureUSDCForAave>>
+
+export interface AaveLiquidityDependencies {
+  getATokenBalance: typeof getATokenBalance
+  getAaveSupplyAvailability: typeof getAaveSupplyAvailability
+  ensureUSDCForAave: (privateKey: `0x${string}`, minAmount: string, walletAddress: `0x${string}`) => Promise<EnsureUSDCForAaveResult>
+  checkAllowance: typeof checkAllowance
+  approveUSDC: typeof approveUSDC
+  addLiquidity: typeof addLiquidity
+  redeemLiquidity: typeof redeemLiquidity
+}
+
+const defaultAaveLiquidityDependencies: AaveLiquidityDependencies = {
+  getATokenBalance,
+  getAaveSupplyAvailability,
+  ensureUSDCForAave,
+  checkAllowance,
+  approveUSDC,
+  addLiquidity,
+  redeemLiquidity
+}
+
 /**
  * Полный процесс управления ликвидностью с проверками
  */
+export async function performLiquidityManagementWithDependencies (privateKey: `0x${string}`, amount: string | null = null, dependencies: AaveLiquidityDependencies = defaultAaveLiquidityDependencies): Promise<{
+  success: boolean
+  walletAddress?: string
+  usdcBalance?: string
+  aTokenBalance?: string
+  depositAmount?: string
+  supplyTransactionHash?: string
+  withdrawTransactionHash?: string | null
+  explorerUrl?: string
+  usdcPurchased?: boolean
+  usdcPurchaseHash?: string | undefined
+  usdcPurchaseAmount?: string | undefined
+  skipped?: boolean
+  reason?: string
+  depositSkipped?: boolean
+  depositSkipReason?: AaveSupplyAvailabilityReason
+  error?: string
+}> {
+  try {
+    const account = privateKeyToAccount(privateKey)
+    logger.info(`[Aave] Кошелек: ${account.address}`)
+
+    const aTokenBalance = await dependencies.getATokenBalance(account.address)
+
+    if (parseFloat(aTokenBalance) > 0) {
+      logger.info(`[Aave] Обнаружена ликвидность ${aTokenBalance} aToken, выводим`)
+      const withdrawTxHash = await dependencies.redeemLiquidity(privateKey)
+
+      return {
+        success: true,
+        walletAddress: account.address,
+        aTokenBalance: aTokenBalance,
+        withdrawTransactionHash: withdrawTxHash,
+        explorerUrl: `https://soneium.blockscout.com/tx/${withdrawTxHash}`
+      }
+    } else {
+      logger.info('[Aave] Нет ликвидности для вывода, депозиты отключены')
+      return {
+        success: true,
+        skipped: true,
+        reason: 'withdrawal_only_mode',
+        walletAddress: account.address,
+        aTokenBalance
+      }
+    }
+
+  } catch (error) {
+    logger.error('Ошибка при управлении ликвидностью', error)
+    return {
+      success: false,
+      error: error instanceof Error ? error.message : 'Неизвестная ошибка'
+    }
+  }
+}
+
 export async function performLiquidityManagement (privateKey: `0x${string}`, amount: string | null = null): Promise<{
   success: boolean
   walletAddress?: string
@@ -750,70 +965,13 @@ export async function performLiquidityManagement (privateKey: `0x${string}`, amo
   usdcPurchased?: boolean
   usdcPurchaseHash?: string | undefined
   usdcPurchaseAmount?: string | undefined
+  skipped?: boolean
+  reason?: string
+  depositSkipped?: boolean
+  depositSkipReason?: AaveSupplyAvailabilityReason
   error?: string
 }> {
-  try {
-    const account = privateKeyToAccount(privateKey)
-    logger.info(`[Aave] Кошелек: ${account.address}`)
-
-    const aTokenBalance = await getATokenBalance(account.address)
-
-    if (parseFloat(aTokenBalance) > 0) {
-      logger.info(`[Aave] Обнаружена ликвидность ${aTokenBalance} aToken, выводим`)
-      const withdrawTxHash = await redeemLiquidity(privateKey)
-
-      return {
-        success: true,
-        walletAddress: account.address,
-        aTokenBalance: aTokenBalance,
-        withdrawTransactionHash: withdrawTxHash,
-        explorerUrl: `https://soneium.blockscout.com/tx/${withdrawTxHash}`
-      }
-    } else {
-      const usdcBalanceResult = await ensureUSDCForAave(privateKey, '1', account.address)
-
-      if (!usdcBalanceResult.success) {
-        throw new Error(`Не удалось обеспечить наличие USDC.e: ${usdcBalanceResult.error}`)
-      }
-
-      const usdcBalance = usdcBalanceResult.usdcBalance
-
-      const randomAmount = (Math.random() * 4 + 1).toFixed(6)
-      let depositAmount = amount || randomAmount
-
-      if (parseFloat(depositAmount) > parseFloat(usdcBalance)) {
-        depositAmount = usdcBalance
-      }
-
-      const hasAllowance = await checkAllowance(account.address, depositAmount)
-      if (!hasAllowance) {
-        await approveUSDC(privateKey, depositAmount)
-      }
-
-      logger.info(`[Aave] Депозит ${depositAmount} USDC.e`)
-      const supplyTxHash = await addLiquidity(privateKey, depositAmount)
-
-      return {
-        success: true,
-        walletAddress: account.address,
-        usdcBalance: usdcBalance,
-        aTokenBalance: aTokenBalance,
-        depositAmount: depositAmount,
-        supplyTransactionHash: supplyTxHash,
-        explorerUrl: `https://soneium.blockscout.com/tx/${supplyTxHash}`,
-        usdcPurchased: usdcBalanceResult.purchased || false,
-        usdcPurchaseHash: usdcBalanceResult.purchaseHash || undefined,
-        usdcPurchaseAmount: usdcBalanceResult.purchaseAmount || undefined
-      }
-    }
-
-  } catch (error) {
-    logger.error('Ошибка при управлении ликвидностью', error)
-    return {
-      success: false,
-      error: error instanceof Error ? error.message : 'Неизвестная ошибка'
-    }
-  }
+  return await performLiquidityManagementWithDependencies(privateKey, amount, defaultAaveLiquidityDependencies)
 }
 
 // Экспорт констант для использования в других модулях

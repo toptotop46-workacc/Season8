@@ -5,7 +5,7 @@ import { rpcManager, soneiumChain } from '../rpc-manager.js'
 import { safeWriteContract } from '../transaction-utils.js'
 import { logger } from '../logger.js'
 
-// Адреса контрактов Sake Finance (Aave протокол)
+// Адреса контрактов Sake Finance
 const L2_POOL_INSTANCE = '0x3c3987a310ee13f7b8cbbe21d97d4436ba5e4b5f' // L2PoolInstance контракт
 const A_TOKEN_INSTANCE = '0x4491B60c8fdD668FcC2C4dcADf9012b3fA71a726' // ATokenInstance контракт
 const USDC_E_TOKEN = '0xbA9986D2381edf1DA03B0B9c1f8b00dc4AacC369' // USDC.e токен
@@ -139,6 +139,57 @@ const A_TOKEN_ABI = [
 // Создание публичного клиента
 const publicClient = rpcManager.createPublicClient(soneiumChain)
 const SAKE_SIMULATION_TIMEOUT_MS = 15000
+const SAKE_ACTIVE_BIT = 56n
+const SAKE_FROZEN_BIT = 57n
+const SAKE_PAUSED_BIT = 60n
+const SAKE_SUPPLY_CAP_START_BIT = 116n
+const SAKE_SUPPLY_CAP_BIT_LENGTH = 36n
+const SAKE_DEFAULT_PROBE_ADDRESS = '0x1111111111111111111111111111111111111111' as const
+
+type SakeRuntimeProbeReason =
+  | 'runtime_unauthorized'
+  | 'runtime_withdrawals_disabled'
+  | 'runtime_revert'
+  | 'timeout'
+  | 'insufficient_funds'
+  | 'unknown_runtime_error'
+
+export type SakeDepositAvailabilityReason =
+  | 'available'
+  | 'inactive_reserve'
+  | 'reserve_frozen'
+  | 'reserve_paused'
+  | 'supply_cap_reached'
+  | SakeRuntimeProbeReason
+
+export type SakeWithdrawProtocolGateReason =
+  | 'available'
+  | 'inactive_reserve'
+  | 'reserve_paused'
+
+export interface SakeDepositAvailabilityPlan {
+  status: 'available' | 'unavailable'
+  reason: SakeDepositAvailabilityReason
+}
+
+export interface SakeWithdrawProtocolGatePlan {
+  status: 'available' | 'unavailable'
+  reason: SakeWithdrawProtocolGateReason
+}
+
+interface SakeReserveStatusSnapshot {
+  isActive: boolean
+  isFrozen: boolean
+  isPaused: boolean
+  supplyCapUnits: bigint
+  totalSupplyUnits: bigint
+  requestedSupplyUnits: bigint
+}
+
+interface SakeWithdrawProtocolGateSnapshot {
+  isActive: boolean
+  isPaused: boolean
+}
 
 interface SakePreflightResult {
   ok: boolean
@@ -146,6 +197,12 @@ interface SakePreflightResult {
 }
 
 function normalizeSakeSimulationError (message: string): string {
+  if (message.includes('Unauthorized')) {
+    return 'Операция Sake Finance сейчас недоступна: Unauthorized'
+  }
+  if (message.includes('Withdrawals disabled')) {
+    return 'Операция Sake Finance сейчас недоступна: Withdrawals disabled'
+  }
   if (message.includes('revert') || message.includes('execution reverted')) {
     return 'Операция Sake Finance сейчас недоступна: симуляция показывает revert'
   }
@@ -156,6 +213,264 @@ function normalizeSakeSimulationError (message: string): string {
     return 'Не удалось проверить операцию Sake Finance: таймаут симуляции'
   }
   return `Не удалось выполнить preflight-проверку Sake Finance: ${message}`
+}
+
+function isBitSet (value: bigint, bit: bigint): boolean {
+  return ((value >> bit) & 1n) === 1n
+}
+
+function decodeSakeSupplyCap (configData: bigint): bigint {
+  return (configData >> SAKE_SUPPLY_CAP_START_BIT) & ((1n << SAKE_SUPPLY_CAP_BIT_LENGTH) - 1n)
+}
+
+function getSakeRuntimeProbeReason (message: string | undefined): SakeRuntimeProbeReason {
+  if (!message) {
+    return 'unknown_runtime_error'
+  }
+
+  if (message.includes('Unauthorized')) {
+    return 'runtime_unauthorized'
+  }
+  if (message.includes('Withdrawals disabled')) {
+    return 'runtime_withdrawals_disabled'
+  }
+  if (message.includes('таймаут') || message.includes('timeout')) {
+    return 'timeout'
+  }
+  if (message.includes('Недостаточно средств') || message.includes('insufficient')) {
+    return 'insufficient_funds'
+  }
+  if (message.includes('revert')) {
+    return 'runtime_revert'
+  }
+
+  return 'unknown_runtime_error'
+}
+
+function formatSakeDepositAvailabilityReason (reason: SakeDepositAvailabilityReason): string {
+  switch (reason) {
+  case 'inactive_reserve':
+    return 'reserve inactive'
+  case 'reserve_frozen':
+    return 'reserve frozen'
+  case 'reserve_paused':
+    return 'reserve paused'
+  case 'supply_cap_reached':
+    return 'supply cap reached'
+  case 'runtime_unauthorized':
+    return 'runtime unauthorized'
+  case 'runtime_withdrawals_disabled':
+    return 'runtime withdrawals disabled'
+  case 'runtime_revert':
+    return 'runtime revert'
+  case 'timeout':
+    return 'runtime timeout'
+  case 'insufficient_funds':
+    return 'insufficient funds'
+  case 'unknown_runtime_error':
+    return 'unknown runtime error'
+  default:
+    return 'available'
+  }
+}
+
+export function classifySakeWithdrawRuntimeHandling (message: string):
+{ skip: true, reason: SakeRuntimeProbeReason, message: string } | { skip: false } {
+  const reason = getSakeRuntimeProbeReason(message)
+
+  if (reason === 'runtime_withdrawals_disabled') {
+    return {
+      skip: true,
+      reason,
+      message: 'runtime withdrawals disabled'
+    }
+  }
+
+  return {
+    skip: false
+  }
+}
+
+export function classifySakeWithdrawErrorLogging (message: string): {
+  level: 'warn' | 'error'
+  message: string
+} {
+  const handling = classifySakeWithdrawRuntimeHandling(message)
+  if (handling.skip) {
+    return {
+      level: 'warn',
+      message: `Ошибка при выводе ликвидности: ${handling.message}`
+    }
+  }
+
+  return {
+    level: 'error',
+    message: 'Ошибка при выводе ликвидности'
+  }
+}
+
+export function planSakeDepositAvailability (snapshot: SakeReserveStatusSnapshot): SakeDepositAvailabilityPlan {
+  if (!snapshot.isActive) {
+    return { status: 'unavailable', reason: 'inactive_reserve' }
+  }
+
+  if (snapshot.isFrozen) {
+    return { status: 'unavailable', reason: 'reserve_frozen' }
+  }
+
+  if (snapshot.isPaused) {
+    return { status: 'unavailable', reason: 'reserve_paused' }
+  }
+
+  if (snapshot.supplyCapUnits > 0n) {
+    const projectedSupply = snapshot.totalSupplyUnits + snapshot.requestedSupplyUnits
+    if (projectedSupply > snapshot.supplyCapUnits) {
+      return { status: 'unavailable', reason: 'supply_cap_reached' }
+    }
+  }
+
+  return { status: 'available', reason: 'available' }
+}
+
+export function planSakeWithdrawProtocolGate (snapshot: SakeWithdrawProtocolGateSnapshot): SakeWithdrawProtocolGatePlan {
+  if (!snapshot.isActive) {
+    return { status: 'unavailable', reason: 'inactive_reserve' }
+  }
+
+  if (snapshot.isPaused) {
+    return { status: 'unavailable', reason: 'reserve_paused' }
+  }
+
+  return { status: 'available', reason: 'available' }
+}
+
+async function getSakeReserveConfiguration (): Promise<{ data: bigint }> {
+  return await publicClient.readContract({
+    address: L2_POOL_INSTANCE,
+    abi: [
+      {
+        'inputs': [{ 'internalType': 'address', 'name': 'asset', 'type': 'address' }],
+        'name': 'getConfiguration',
+        'outputs': [
+          {
+            'components': [{ 'internalType': 'uint256', 'name': 'data', 'type': 'uint256' }],
+            'internalType': 'struct DataTypes.ReserveConfigurationMap',
+            'name': '',
+            'type': 'tuple'
+          }
+        ],
+        'stateMutability': 'view',
+        'type': 'function'
+      }
+    ] as const,
+    functionName: 'getConfiguration',
+    args: [USDC_E_TOKEN]
+  })
+}
+
+export async function probeSakeDepositExecution (
+  amount: string,
+  probeAddress: `0x${string}` = SAKE_DEFAULT_PROBE_ADDRESS
+): Promise<SakeDepositAvailabilityPlan> {
+  const decimals = await publicClient.readContract({
+    address: USDC_E_TOKEN,
+    abi: ERC20_ABI,
+    functionName: 'decimals'
+  })
+  const amountWei = parseUnits(amount, decimals)
+  const preflight = await simulateSakeContractWrite(probeAddress, {
+    chain: soneiumChain,
+    account: probeAddress,
+    address: L2_POOL_INSTANCE,
+    abi: L2_POOL_ABI,
+    functionName: 'supply',
+    args: [USDC_E_TOKEN, amountWei, probeAddress, 0]
+  })
+
+  if (preflight.ok) {
+    return { status: 'available', reason: 'available' }
+  }
+
+  return {
+    status: 'unavailable',
+    reason: getSakeRuntimeProbeReason(preflight.reason)
+  }
+}
+
+export async function probeSakeWithdrawExecution (
+  amount: string,
+  probeAddress: `0x${string}` = SAKE_DEFAULT_PROBE_ADDRESS
+): Promise<SakeDepositAvailabilityPlan> {
+  const decimals = await publicClient.readContract({
+    address: USDC_E_TOKEN,
+    abi: ERC20_ABI,
+    functionName: 'decimals'
+  })
+  const amountWei = parseUnits(amount, decimals)
+  const preflight = await simulateSakeContractWrite(probeAddress, {
+    chain: soneiumChain,
+    account: probeAddress,
+    address: L2_POOL_INSTANCE,
+    abi: L2_POOL_ABI,
+    functionName: 'withdraw',
+    args: [USDC_E_TOKEN, amountWei, probeAddress]
+  })
+
+  if (preflight.ok) {
+    return { status: 'available', reason: 'available' }
+  }
+
+  return {
+    status: 'unavailable',
+    reason: getSakeRuntimeProbeReason(preflight.reason)
+  }
+}
+
+export async function checkSakeDepositAvailability (amount: string): Promise<SakeDepositAvailabilityPlan> {
+  const [decimals, config, totalSupply] = await Promise.all([
+    publicClient.readContract({
+      address: USDC_E_TOKEN,
+      abi: ERC20_ABI,
+      functionName: 'decimals'
+    }),
+    getSakeReserveConfiguration(),
+    publicClient.readContract({
+      address: A_TOKEN_INSTANCE,
+      abi: A_TOKEN_ABI,
+      functionName: 'totalSupply'
+    })
+  ])
+
+  const configData = config.data
+  const requestedSupplyUnits = parseUnits(amount, decimals)
+  const reserveUnit = 10n ** BigInt(decimals)
+  const supplyCapTokens = decodeSakeSupplyCap(configData)
+  const supplyCapUnits = supplyCapTokens === 0n ? 0n : supplyCapTokens * reserveUnit
+
+  const plan = planSakeDepositAvailability({
+    isActive: isBitSet(configData, SAKE_ACTIVE_BIT),
+    isFrozen: isBitSet(configData, SAKE_FROZEN_BIT),
+    isPaused: isBitSet(configData, SAKE_PAUSED_BIT),
+    supplyCapUnits,
+    totalSupplyUnits: totalSupply,
+    requestedSupplyUnits
+  })
+
+  if (plan.status === 'unavailable') {
+    return plan
+  }
+
+  return await probeSakeDepositExecution(amount)
+}
+
+export async function checkSakeWithdrawProtocolGate (): Promise<SakeWithdrawProtocolGatePlan> {
+  const config = await getSakeReserveConfiguration()
+  const configData = config.data
+
+  return planSakeWithdrawProtocolGate({
+    isActive: isBitSet(configData, SAKE_ACTIVE_BIT),
+    isPaused: isBitSet(configData, SAKE_PAUSED_BIT)
+  })
 }
 
 async function simulateSakeContractWrite (
@@ -316,13 +631,15 @@ export async function approveUSDC (privateKey: `0x${string}`, amount: string): P
     )
     if (!txResult.success) throw new Error(txResult.error)
     const hash = txResult.hash
+    logger.transaction(hash, 'sent', 'SAKE_FINANCE', 'APPROVE')
 
     const receipt = await publicClient.waitForTransactionReceipt({ hash })
 
     if (receipt.status === 'success') {
-      logger.transaction(hash, 'confirmed', 'SAKE_FINANCE', account.address)
+      logger.transaction(hash, 'confirmed', 'SAKE_FINANCE', account.address, 'APPROVE')
       await new Promise(resolve => setTimeout(resolve, 30000))
     } else {
+      logger.transaction(hash, 'failed', 'SAKE_FINANCE', 'APPROVE')
       throw new Error('Approve transaction failed')
     }
 
@@ -386,6 +703,7 @@ export async function addLiquidity (privateKey: `0x${string}`, amount: string): 
       )
       if (!txResult.success) throw new Error(txResult.error)
       hash = txResult.hash
+      logger.transaction(hash, 'sent', 'SAKE_FINANCE', 'DEPOSIT')
       receipt = await publicClient.waitForTransactionReceipt({ hash })
     } catch (error) {
       if (error instanceof Error && error.message.includes('gas')) {
@@ -406,6 +724,7 @@ export async function addLiquidity (privateKey: `0x${string}`, amount: string): 
         )
         if (!retryResult.success) throw new Error(retryResult.error)
         hash = retryResult.hash
+        logger.transaction(hash, 'sent', 'SAKE_FINANCE', 'DEPOSIT')
         receipt = await publicClient.waitForTransactionReceipt({ hash })
       } else {
         throw error
@@ -413,7 +732,10 @@ export async function addLiquidity (privateKey: `0x${string}`, amount: string): 
     }
 
     if (receipt.status === 'success') {
+      logger.transaction(hash, 'confirmed', 'SAKE_FINANCE', account.address, 'DEPOSIT')
       await new Promise(resolve => setTimeout(resolve, 30000))
+    } else {
+      logger.transaction(hash, 'failed', 'SAKE_FINANCE', 'DEPOSIT')
     }
 
     return hash
@@ -453,6 +775,7 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
 
     const amountWei = parseUnits(withdrawAmount, decimals)
 
+    // Проверяем возможность вывода через симуляцию
     const preflight = await simulateSakeContractWrite(account.address, {
       chain: soneiumChain,
       account: account,
@@ -463,7 +786,7 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
     })
 
     if (!preflight.ok) {
-      throw new Error(preflight.reason || 'Sake Finance withdraw preflight не пройден')
+      throw new Error(preflight.reason || 'Sake Finance withdraw недоступен (возможно lock period)')
     }
 
     // Выводим ликвидность с увеличенным лимитом газа
@@ -487,6 +810,7 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
       )
       if (!txResult.success) throw new Error(txResult.error)
       hash = txResult.hash
+      logger.transaction(hash, 'sent', 'SAKE_FINANCE', 'WITHDRAW')
       receipt = await publicClient.waitForTransactionReceipt({ hash })
     } catch (error) {
       if (error instanceof Error && error.message.includes('gas')) {
@@ -507,6 +831,7 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
         )
         if (!retryResult.success) throw new Error(retryResult.error)
         hash = retryResult.hash
+        logger.transaction(hash, 'sent', 'SAKE_FINANCE', 'WITHDRAW')
         receipt = await publicClient.waitForTransactionReceipt({ hash })
       } else {
         throw error
@@ -514,13 +839,21 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
     }
 
     if (receipt.status === 'success') {
-      logger.transaction(hash, 'confirmed', 'SAKE_FINANCE', account.address)
+      logger.transaction(hash, 'confirmed', 'SAKE_FINANCE', account.address, 'WITHDRAW')
       await new Promise(resolve => setTimeout(resolve, 30000))
+    } else {
+      logger.transaction(hash, 'failed', 'SAKE_FINANCE', 'WITHDRAW')
     }
 
     return hash
   } catch (error) {
-    logger.error('Ошибка при выводе ликвидности', error)
+    const message = error instanceof Error ? error.message : String(error)
+    const logging = classifySakeWithdrawErrorLogging(message)
+    if (logging.level === 'warn') {
+      logger.warn(`[Sake] ${logging.message}`)
+    } else {
+      logger.error(logging.message, error)
+    }
     throw error
   }
 }
@@ -617,6 +950,8 @@ export async function performSakeFinanceOperations (privateKey: `0x${string}`, a
   success: boolean
   skipped?: boolean
   reason?: string
+  depositSkipped?: boolean
+  depositSkipReason?: SakeDepositAvailabilityReason
   walletAddress?: string
   usdcBalance?: string
   aTokenBalance?: string
@@ -640,79 +975,53 @@ export async function performSakeFinanceOperations (privateKey: `0x${string}`, a
     // 2. Если есть токены ликвидности, выводим их
     if (parseFloat(aTokenBalance) > 0) {
       logger.info('[Sake] Обнаружена ликвидность, вывод...')
-      const withdrawTxHash = await redeemLiquidity(privateKey)
-
-      // Выводим информацию после вывода
-      await displayLiquidityInfo(account.address, 'withdraw', aTokenBalance)
-
-      return {
-        success: true,
-        walletAddress: account.address,
-        aTokenBalance: aTokenBalance,
-        withdrawTransactionHash: withdrawTxHash,
-        explorerUrl: `https://soneium.blockscout.com/tx/${withdrawTxHash}`
-      }
-    } else {
-      // 3. Проверяем и обеспечиваем наличие USDC.e для депозита
-      const usdcBalanceResult = await ensureUSDCBalance(privateKey, '0.0001')
-
-      if (!usdcBalanceResult.success) {
-        throw new Error(`Не удалось обеспечить наличие USDC.e: ${usdcBalanceResult.error}`)
-      }
-
-      const usdcBalance = usdcBalanceResult.usdcBalance
-
-      // 4. Определяем количество для депозита
-      const depositAmount = amount || usdcBalance
-      if (parseFloat(depositAmount) > parseFloat(usdcBalance)) {
-        throw new Error('Недостаточно USDC.e на балансе для указанной суммы')
-      }
-
-      // 5. Проверяем allowance
-      const hasAllowance = await checkAllowance(account.address, depositAmount)
-
-      // 6. Если нужно, выполняем approve
-      if (!hasAllowance) {
-        await approveUSDC(privateKey, depositAmount)
-      }
-
-      // 7. Добавляем ликвидность
-      logger.operation(`Депозит ${depositAmount} USDC.e в Sake Finance`, 'start')
-      let supplyTxHash: string
       try {
-        supplyTxHash = await addLiquidity(privateKey, depositAmount)
+        const withdrawTxHash = await redeemLiquidity(privateKey)
+
+        // Выводим информацию после вывода
+        await displayLiquidityInfo(account.address, 'withdraw', aTokenBalance)
+
+        return {
+          success: true,
+          walletAddress: account.address,
+          aTokenBalance: aTokenBalance,
+          withdrawTransactionHash: withdrawTxHash,
+          explorerUrl: `https://soneium.blockscout.com/tx/${withdrawTxHash}`
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        if (message.includes('симуляция показывает revert')) {
-          logger.warn(`[Sake] Пропуск депозита: ${message}`)
+        const handling = classifySakeWithdrawRuntimeHandling(message)
+
+        if (handling.skip) {
+          logger.warn(`[Sake] Вывод пропущен: ${handling.message}`)
+          logger.logToFile(
+            true,
+            'Sake Finance',
+            'WITHDRAW_SKIPPED',
+            `Кошелек: ${account.address} | Причина: ${handling.reason}`
+          )
+
           return {
-            success: false,
+            success: true,
             skipped: true,
-            reason: message,
-            message,
+            reason: handling.reason,
+            message: handling.message,
             walletAddress: account.address,
-            usdcBalance: usdcBalance,
             aTokenBalance: aTokenBalance,
-            depositAmount: depositAmount
+            withdrawTransactionHash: null
           }
         }
+
         throw error
       }
-
-      // 8. Выводим детальную информацию после депозита
-      await displayLiquidityInfo(account.address, 'supply', depositAmount)
-
+    } else {
+      logger.info('[Sake] Нет ликвидности для вывода, депозиты отключены')
       return {
         success: true,
+        skipped: true,
+        reason: 'withdrawal_only_mode',
         walletAddress: account.address,
-        usdcBalance: usdcBalance,
-        aTokenBalance: aTokenBalance,
-        depositAmount: depositAmount,
-        supplyTransactionHash: supplyTxHash,
-        explorerUrl: `https://soneium.blockscout.com/tx/${supplyTxHash}`,
-        usdcPurchased: usdcBalanceResult.purchased || false,
-        usdcPurchaseHash: usdcBalanceResult.purchaseHash || undefined,
-        usdcPurchaseAmount: usdcBalanceResult.purchaseAmount || undefined
+        aTokenBalance
       }
     }
 
@@ -730,6 +1039,7 @@ export {
   L2_POOL_INSTANCE,
   A_TOKEN_INSTANCE,
   USDC_E_TOKEN,
+  SAKE_DEFAULT_PROBE_ADDRESS,
   ERC20_ABI,
   L2_POOL_ABI,
   A_TOKEN_ABI

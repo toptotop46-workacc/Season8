@@ -43,10 +43,12 @@ export class Logger {
 
   error (message: string, error?: unknown): void {
     if (this.level >= LogLevel.ERROR) {
-      const errorDetail = error
-        ? `: ${error instanceof Error ? error.message : String(error)}`
-        : ''
-      console.error(this.fmt('ERROR', `${message}${errorDetail}`, RED))
+      const rawDetail = error instanceof Error ? error.message : error != null ? String(error) : ''
+      const firstLine = rawDetail.split('\n').map(l => l.trim()).find(l => l.length > 0) ?? ''
+      const errorDetail = firstLine ? `: ${firstLine}` : ''
+      const fullMessage = `${message}${errorDetail}`
+      console.error(this.fmt('ERROR', fullMessage, RED))
+      fileLogger.logFailed('SYSTEM', 'ERROR', fullMessage)
     }
   }
 
@@ -92,21 +94,33 @@ export class Logger {
     }
   }
 
-  transaction (hash: string, type: 'sent' | 'confirmed' | 'failed' = 'sent', moduleName?: string, walletAddress?: string): void {
+  transaction (
+    hash: string,
+    type: 'sent' | 'confirmed' | 'failed' = 'sent',
+    moduleName?: string,
+    walletAddressOrAction?: string,
+    action?: string
+  ): void {
     const link = `https://soneium.blockscout.com/tx/${hash}`
-    const module = moduleName ? `[${moduleName}] ` : ''
+    const maybeAddress = walletAddressOrAction?.startsWith('0x') ? walletAddressOrAction : undefined
+    const resolvedAction = action ?? (walletAddressOrAction && !walletAddressOrAction.startsWith('0x')
+      ? walletAddressOrAction
+      : undefined)
+    const module = moduleName ? `[${moduleName}]` : ''
+    const actionLabel = resolvedAction ? `[${resolvedAction}]` : ''
+    const prefix = `${module}${actionLabel}${module || actionLabel ? ' ' : ''}`
 
     if (type === 'sent') {
-      this.info(`${module}TX отправлена: ${link}`)
+      this.info(`${prefix}TX отправлена: ${link}`)
     } else if (type === 'confirmed') {
-      this.success(`${module}TX подтверждена: ${link}`)
+      this.success(`${prefix}TX подтверждена: ${link}`)
     } else {
-      this.error(`${module}TX не удалась: ${link}`)
+      this.error(`${prefix}TX не удалась: ${link}`)
     }
 
     if (type === 'confirmed' || type === 'failed') {
       const success = type === 'confirmed'
-      const details = walletAddress ? `${walletAddress} - ${link}` : link
+      const details = maybeAddress ? `${maybeAddress} - ${link}` : link
       const mod = moduleName || 'UNKNOWN'
       fileLogger.logTransaction(hash, success, mod, details)
     }

@@ -292,9 +292,10 @@ export class ProxyManager {
 
       // Тестируем несколько URL для более надежной проверки
       const testUrls = [
-        'https://httpbin.org/ip',
         'https://api.ipify.org?format=json',
-        'https://ipapi.co/json/'
+        'https://httpbin.org/ip',
+        'https://ipapi.co/json/',
+        'https://icanhazip.com'
       ]
 
       for (const testUrl of testUrls) {
@@ -302,7 +303,7 @@ export class ProxyManager {
           const testClient = axios.create({
             httpsAgent: proxyAgents.httpsAgent,
             httpAgent: proxyAgents.httpAgent,
-            timeout: 10000 // Увеличиваем таймаут до 10 секунд
+            timeout: 30000 // Увеличиваем таймаут до 30 секунд
           })
 
           const response = await testClient.get(testUrl)

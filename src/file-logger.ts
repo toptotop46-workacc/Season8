@@ -47,6 +47,7 @@ export class FileLogger {
    * Записывает успешную операцию в successful.txt
    */
   logSuccess (module: string, operation: string, details: string): void {
+    this.ensureLogsDirectory()
     const logEntry = this.formatLogEntry(module, operation, details)
     const filePath = join(this.logsDir, 'successful.txt')
     appendFileSync(filePath, logEntry, 'utf8')
@@ -56,6 +57,7 @@ export class FileLogger {
    * Записывает неудачную операцию в failed.txt
    */
   logFailed (module: string, operation: string, details: string): void {
+    this.ensureLogsDirectory()
     const logEntry = this.formatLogEntry(module, operation, details)
     const filePath = join(this.logsDir, 'failed.txt')
     appendFileSync(filePath, logEntry, 'utf8')

@@ -13,3 +13,6 @@ export const LIQUIDITY_SWAP_PERCENT_MAX = 1
 
 /** Симулировать транзакцию перед отправкой (eth_call / simulateContract). Отключить при глючном RPC. */
 export const SIMULATE_BEFORE_SEND = true
+
+/** Строгая симуляция: блокировать транзакции при ошибке симуляции. false = только предупреждение. */
+export const STRICT_SIMULATION = true

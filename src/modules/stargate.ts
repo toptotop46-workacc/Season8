@@ -140,6 +140,51 @@ const LP_TOKEN_ABI = [
 // Создание публичного клиента
 const publicClient = rpcManager.createPublicClient(soneiumChain)
 
+export type StargateRedeemPlan = {
+  status: 'available' | 'unavailable'
+  amountToRedeem: bigint
+  reason: 'full_redeemable_balance' | 'partial_redeemable_balance' | 'no_redeemable_balance'
+  isPartial: boolean
+}
+
+export function planStargateRedeem (params: {
+  redeemableAmount: bigint
+  requestedAmount: bigint
+}): StargateRedeemPlan {
+  const { redeemableAmount, requestedAmount } = params
+  const cappedRequest = requestedAmount > redeemableAmount ? redeemableAmount : requestedAmount
+
+  if (cappedRequest === 0n) {
+    return {
+      status: 'unavailable',
+      amountToRedeem: 0n,
+      reason: 'no_redeemable_balance',
+      isPartial: false
+    }
+  }
+
+  if (requestedAmount > redeemableAmount) {
+    return {
+      status: 'available',
+      amountToRedeem: redeemableAmount,
+      reason: 'partial_redeemable_balance',
+      isPartial: true
+    }
+  }
+
+  return {
+    status: 'available',
+    amountToRedeem: cappedRequest,
+    reason: 'full_redeemable_balance',
+    isPartial: false
+  }
+}
+
+export function isStargateRedeemTemporarilyUnavailable (message: string): boolean {
+  return message.includes('Симуляция: Транзакция откатится (revert)') ||
+    message.includes('execution reverted')
+}
+
 /**
  * Получает баланс USDC.e токена для указанного адреса
  */
@@ -299,15 +344,15 @@ export async function approveUSDC (privateKey: `0x${string}`, amount: string): P
     if (!txResult.success) throw new Error(txResult.error)
     const hash = txResult.hash
 
-    logger.transaction(hash, 'sent', 'STARGATE')
+    logger.transaction(hash, 'sent', 'STARGATE', 'APPROVE')
 
     // Ожидаем подтверждения
     const receipt = await publicClient.waitForTransactionReceipt({ hash })
 
     if (receipt.status === 'success') {
-      logger.transaction(hash, 'confirmed', 'STARGATE', account.address)
+      logger.transaction(hash, 'confirmed', 'STARGATE', account.address, 'APPROVE')
     } else {
-      logger.transaction(hash, 'failed', 'STARGATE')
+      logger.transaction(hash, 'failed', 'STARGATE', 'APPROVE')
       throw new Error('Approve transaction failed')
     }
 
@@ -356,7 +401,7 @@ export async function addLiquidity (privateKey: `0x${string}`, amount: string): 
       )
       if (!txResult.success) throw new Error(txResult.error)
       hash = txResult.hash
-      logger.transaction(hash, 'sent', 'STARGATE')
+      logger.transaction(hash, 'sent', 'STARGATE', 'DEPOSIT')
       receipt = await publicClient.waitForTransactionReceipt({ hash })
     } catch (error) {
       if (error instanceof Error && error.message.includes('gas')) {
@@ -383,8 +428,10 @@ export async function addLiquidity (privateKey: `0x${string}`, amount: string): 
       }
     }
 
-    if (receipt.status !== 'success') {
-      logger.transaction(hash, 'failed', 'STARGATE')
+    if (receipt.status === 'success') {
+      logger.transaction(hash, 'confirmed', 'STARGATE', account.address, 'DEPOSIT')
+    } else {
+      logger.transaction(hash, 'failed', 'STARGATE', 'DEPOSIT')
     }
 
     return hash
@@ -397,7 +444,7 @@ export async function addLiquidity (privateKey: `0x${string}`, amount: string): 
 /**
  * Выводит ликвидность (redeem) из Stargate пула
  */
-export async function redeemLiquidity (privateKey: `0x${string}`, amount: string | null = null): Promise<string> {
+export async function redeemLiquidity (privateKey: `0x${string}`, amount: string | null = null): Promise<string | null> {
   try {
     const account = privateKeyToAccount(privateKey)
 
@@ -410,19 +457,29 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
       throw new Error('Нет redeemable токенов для вывода')
     }
 
-    // Определяем количество для вывода
-    const redeemAmount = amount || redeemableBalance
-    if (parseFloat(redeemAmount) > parseFloat(redeemableBalance)) {
-      throw new Error('Недостаточно redeemable токенов для указанной суммы')
-    }
-
     const decimals = await publicClient.readContract({
       address: USDC_E_TOKEN,
       abi: ERC20_ABI,
       functionName: 'decimals'
     })
 
-    const amountWei = parseUnits(redeemAmount, decimals)
+    const requestedAmountWei = amount ? parseUnits(amount, decimals) : parseUnits(redeemableBalance, decimals)
+    const redeemableAmountWei = parseUnits(redeemableBalance, decimals)
+    const plan = planStargateRedeem({
+      redeemableAmount: redeemableAmountWei,
+      requestedAmount: requestedAmountWei
+    })
+
+    if (plan.status === 'unavailable') {
+      logger.warn('[Stargate] Вывод сейчас недоступен: redeemable баланс равен 0')
+      return null
+    }
+
+    if (plan.isPartial) {
+      logger.warn(`[Stargate] Доступен только частичный вывод: ${formatUnits(plan.amountToRedeem, decimals)} из ${formatUnits(requestedAmountWei, decimals)} USDC.e`)
+    }
+
+    const amountWei = plan.amountToRedeem
 
     // Выводим ликвидность с увеличенным лимитом газа
     let hash: `0x${string}`
@@ -445,7 +502,7 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
       )
       if (!txResult.success) throw new Error(txResult.error)
       hash = txResult.hash
-      logger.transaction(hash, 'sent', 'STARGATE')
+      logger.transaction(hash, 'sent', 'STARGATE', 'REDEEM')
       receipt = await publicClient.waitForTransactionReceipt({ hash })
     } catch (error) {
       if (error instanceof Error && error.message.includes('gas')) {
@@ -472,12 +529,19 @@ export async function redeemLiquidity (privateKey: `0x${string}`, amount: string
       }
     }
 
-    if (receipt.status !== 'success') {
-      logger.transaction(hash, 'failed', 'STARGATE')
+    if (receipt.status === 'success') {
+      logger.transaction(hash, 'confirmed', 'STARGATE', account.address, 'REDEEM')
+    } else {
+      logger.transaction(hash, 'failed', 'STARGATE', 'REDEEM')
     }
 
     return hash
   } catch (error) {
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    if (isStargateRedeemTemporarilyUnavailable(errorMessage)) {
+      logger.warn('[Stargate] Вывод временно недоступен: симуляция показывает revert')
+      return null
+    }
     logger.error('Ошибка при выводе ликвидности', error)
     throw error
   }
@@ -561,6 +625,9 @@ export async function performLiquidityManagement (privateKey: `0x${string}`, amo
   depositTransactionHash?: string
   redeemTransactionHash?: string | null
   explorerUrl?: string
+  skipped?: boolean
+  reason?: string
+  redeemSkipped?: boolean
   usdcPurchased?: boolean
   usdcPurchaseHash?: string | undefined
   usdcPurchaseAmount?: string | undefined
@@ -576,6 +643,16 @@ export async function performLiquidityManagement (privateKey: `0x${string}`, amo
       logger.info('[Stargate] Вывод ликвидности')
       const redeemTxHash = await redeemLiquidity(privateKey)
 
+      if (redeemTxHash === null) {
+        return {
+          success: true,
+          walletAddress: account.address,
+          redeemableBalance,
+          redeemTransactionHash: null,
+          redeemSkipped: true
+        }
+      }
+
       await displayLiquidityInfo(account.address, 'redeem', redeemableBalance, redeemTxHash)
 
       return {
@@ -586,43 +663,13 @@ export async function performLiquidityManagement (privateKey: `0x${string}`, amo
         explorerUrl: `https://soneium.blockscout.com/tx/${redeemTxHash}`
       }
     } else {
-      const usdcBalanceResult = await ensureUSDCBalance(privateKey, '0.0001')
-
-      if (!usdcBalanceResult.success) {
-        throw new Error(`Не удалось обеспечить наличие USDC.e: ${usdcBalanceResult.error}`)
-      }
-
-      const usdcBalance = usdcBalanceResult.usdcBalance
-
-      const depositAmount = amount || usdcBalance
-      if (parseFloat(depositAmount) > parseFloat(usdcBalance)) {
-        throw new Error('Недостаточно USDC.e на балансе для указанной суммы')
-      }
-
-      logger.info(`[Stargate] Депозит: ${depositAmount} USDC.e`)
-
-      const hasAllowance = await checkAllowance(account.address, depositAmount)
-
-      if (!hasAllowance) {
-        logger.warn('Недостаточно allowance, выполняем approve...')
-        await approveUSDC(privateKey, depositAmount)
-      }
-
-      const depositTxHash = await addLiquidity(privateKey, depositAmount)
-
-      await displayLiquidityInfo(account.address, 'deposit', depositAmount, depositTxHash)
-
+      logger.info('[Stargate] Нет ликвидности для вывода, депозиты отключены')
       return {
         success: true,
+        skipped: true,
+        reason: 'withdrawal_only_mode',
         walletAddress: account.address,
-        usdcBalance: usdcBalance,
-        redeemableBalance: redeemableBalance,
-        depositAmount: depositAmount,
-        depositTransactionHash: depositTxHash,
-        explorerUrl: `https://soneium.blockscout.com/tx/${depositTxHash}`,
-        usdcPurchased: usdcBalanceResult.purchased || false,
-        usdcPurchaseHash: usdcBalanceResult.purchaseHash || undefined,
-        usdcPurchaseAmount: usdcBalanceResult.purchaseAmount || undefined
+        redeemableBalance
       }
     }
 

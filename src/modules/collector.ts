@@ -1,9 +1,11 @@
 import { formatUnits, formatEther } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
 import { SoneiumSwap } from './jumper.js'
-import { redeemLiquidity } from './sake-finance.js'
+import { redeem as redeemMorphoLiquidity, isMorphoNotEnoughLiquidityError } from './morpho.js'
+import { redeemLiquidity as redeemStargateLiquidity } from './stargate.js'
+import { redeemLiquidity, classifySakeWithdrawRuntimeHandling } from './sake-finance.js'
 import { redeemLiquidity as redeemAaveLiquidity } from './aave.js'
-import { withdraw as withdrawFromUntitledBank } from './untitled-bank.js'
+import { getUntitledBankWithdrawPreview, withdraw as withdrawFromUntitledBank } from './untitled-bank.js'
 import { rpcManager, soneiumChain } from '../rpc-manager.js'
 import { safeWriteContract } from '../transaction-utils.js'
 import { logger } from '../logger.js'
@@ -73,21 +75,6 @@ const ERC20_ABI = [
   }
 ] as const
 
-// ABI для Morpho MetaMorpho
-const MORPHO_ABI = [
-  {
-    'inputs': [
-      { 'internalType': 'uint256', 'name': 'shares', 'type': 'uint256' },
-      { 'internalType': 'address', 'name': 'receiver', 'type': 'address' },
-      { 'internalType': 'address', 'name': 'owner', 'type': 'address' }
-    ],
-    'name': 'redeem',
-    'outputs': [{ 'internalType': 'uint256', 'name': 'assets', 'type': 'uint256' }],
-    'stateMutability': 'nonpayable',
-    'type': 'function'
-  }
-] as const
-
 // ABI для Stargate
 const STARGATE_ABI = [
   {
@@ -135,6 +122,23 @@ interface CollectionResult {
   withdrawnLiquidity: LiquidityInfo[]
   totalCollected: string
   error?: string
+}
+
+type WithdrawalExecutionOutcome = 'withdrawn' | 'skipped' | 'failed'
+
+export function resolveCollectorWithdrawalOutcome (
+  protocol: string,
+  transactionHash: string | null | undefined
+): WithdrawalExecutionOutcome {
+  if (transactionHash) {
+    return 'withdrawn'
+  }
+
+  if (protocol === 'Untitled Bank' || protocol === 'Stargate' || protocol === 'Sake Finance') {
+    return 'skipped'
+  }
+
+  return 'failed'
 }
 
 export class SoneiumCollector {
@@ -230,13 +234,16 @@ export class SoneiumCollector {
         return false
       }
       const hash = txResult.hash
-      logger.transaction(hash, 'sent', 'COLLECTOR')
+      logger.transaction(hash, 'sent', 'COLLECTOR', 'APPROVE')
 
       const receipt = await this.client.waitForTransactionReceipt({ hash })
       const success = receipt.status === 'success'
 
       if (!success) {
+        logger.transaction(hash, 'failed', 'COLLECTOR', 'APPROVE')
         logger.error(`Ошибка установки approve для токена ${tokenAddress}`)
+      } else {
+        logger.transaction(hash, 'confirmed', 'COLLECTOR', this.account.address, 'APPROVE')
       }
 
       return success
@@ -460,14 +467,9 @@ export class SoneiumCollector {
    */
   async checkUntitledBankLiquidity (): Promise<LiquidityInfo> {
     try {
-      const balance = await this.client.readContract({
-        address: PROTOCOL_CONTRACTS.UNTITLED_BANK,
-        abi: ERC20_ABI,
-        functionName: 'balanceOf',
-        args: [this.account.address]
-      })
-
-      const hasLiquidity = balance > 0n
+      const preview = await getUntitledBankWithdrawPreview(this.account.address)
+      const hasLiquidity = preview.plan.status === 'available' && preview.plan.sharesToRedeem > 0n
+      const balance = hasLiquidity ? preview.plan.sharesToRedeem : 0n
 
       return {
         protocol: 'Untitled Bank',
@@ -527,84 +529,30 @@ export class SoneiumCollector {
   /**
    * Вывести ликвидность из протокола Morpho
    */
-  async withdrawFromMorpho (amount: bigint): Promise<boolean> {
+  async withdrawFromMorpho (): Promise<WithdrawalExecutionOutcome> {
     try {
-      // Получаем рекомендуемый лимит газа и увеличиваем на 50%
-      const estimatedGas = await this.client.estimateContractGas({
-        address: PROTOCOL_CONTRACTS.MORPHO_METAMORPHO as `0x${string}`,
-        abi: MORPHO_ABI,
-        functionName: 'redeem',
-        args: [amount, this.getWalletAddress(), this.getWalletAddress()],
-        account: this.account
-      })
-
-      const gasLimit = BigInt(Math.floor(Number(estimatedGas) * 1.5))
-
-      const txResult = await safeWriteContract(
-        this.client,
-        this.walletClient,
-        this.account.address,
-        {
-          address: PROTOCOL_CONTRACTS.MORPHO_METAMORPHO as `0x${string}`,
-          abi: MORPHO_ABI,
-          functionName: 'redeem',
-          args: [amount, this.getWalletAddress(), this.getWalletAddress()],
-          account: this.account,
-          chain: this.client.chain,
-          gas: gasLimit
-        }
-      )
-      if (!txResult.success) {
-        logger.error(`Ошибка вывода из Morpho: ${txResult.error}`)
-        return false
-      }
-      const receipt = await this.client.waitForTransactionReceipt({ hash: txResult.hash })
-      return receipt.status === 'success'
+      const transactionHash = await redeemMorphoLiquidity(this.privateKey, null)
+      return Boolean(transactionHash) ? 'withdrawn' : 'failed'
     } catch (error) {
-      logger.error('Ошибка вывода из Morpho', error)
-      return false
+      const message = error instanceof Error ? error.message : String(error)
+      if (isMorphoNotEnoughLiquidityError(message)) {
+        logger.warn('[Morpho] Недостаточно ликвидности в vault — попробуйте позже')
+        return 'skipped'
+      }
+      return 'failed'
     }
   }
 
   /**
    * Вывести ликвидность из протокола Stargate
    */
-  async withdrawFromStargate (amount: bigint): Promise<boolean> {
+  async withdrawFromStargate (amount: bigint): Promise<WithdrawalExecutionOutcome> {
     try {
-      // Получаем рекомендуемый лимит газа и увеличиваем на 50%
-      const estimatedGas = await this.client.estimateContractGas({
-        address: PROTOCOL_CONTRACTS.STARGATE_POOL as `0x${string}`,
-        abi: STARGATE_ABI,
-        functionName: 'redeem',
-        args: [amount, this.getWalletAddress()],
-        account: this.account
-      })
-
-      const gasLimit = BigInt(Math.floor(Number(estimatedGas) * 1.5))
-
-      const txResult = await safeWriteContract(
-        this.client,
-        this.walletClient,
-        this.account.address,
-        {
-          address: PROTOCOL_CONTRACTS.STARGATE_POOL as `0x${string}`,
-          abi: STARGATE_ABI,
-          functionName: 'redeem',
-          args: [amount, this.getWalletAddress()],
-          account: this.account,
-          chain: this.client.chain,
-          gas: gasLimit
-        }
-      )
-      if (!txResult.success) {
-        logger.error(`Ошибка вывода из Stargate: ${txResult.error}`)
-        return false
-      }
-      const receipt = await this.client.waitForTransactionReceipt({ hash: txResult.hash })
-      return receipt.status === 'success'
+      const transactionHash = await redeemStargateLiquidity(this.privateKey, formatUnits(amount, 6))
+      return resolveCollectorWithdrawalOutcome('Stargate', transactionHash)
     } catch (error) {
       logger.error('Ошибка вывода из Stargate', error)
-      return false
+      return 'failed'
     }
   }
 
@@ -617,30 +565,29 @@ export class SoneiumCollector {
     for (const info of liquidityInfo) {
       if (!info.hasLiquidity || info.balanceWei === 0n) continue
 
-      let success = false
+      let outcome: WithdrawalExecutionOutcome = 'failed'
 
       switch (info.protocol) {
       case 'Aave':
-        success = await this.withdrawFromAave()
+        outcome = await this.withdrawFromAave() ? 'withdrawn' : 'failed'
         break
       case 'Morpho':
-        success = await this.withdrawFromMorpho(info.balanceWei)
+        outcome = await this.withdrawFromMorpho()
         break
       case 'Stargate':
-        success = await this.withdrawFromStargate(info.balanceWei)
+        outcome = await this.withdrawFromStargate(info.balanceWei)
         break
       case 'Sake Finance':
-        // Для Sake Finance используем стандартный ERC20 transfer
-        success = await this.withdrawFromSakeFinance()
+        outcome = await this.withdrawFromSakeFinance()
         break
       case 'Untitled Bank':
-        success = await this.withdrawFromUntitledBank()
+        outcome = await this.withdrawFromUntitledBank()
         break
       }
 
-      if (success) {
+      if (outcome === 'withdrawn') {
         withdrawnLiquidity.push(info)
-      } else {
+      } else if (outcome === 'failed') {
         logger.error(`Ошибка вывода ликвидности из ${info.protocol}`)
       }
     }
@@ -651,38 +598,32 @@ export class SoneiumCollector {
   /**
    * Вывести ликвидность из Sake Finance (ERC20 токен)
    */
-  async withdrawFromSakeFinance (): Promise<boolean> {
+  async withdrawFromSakeFinance (): Promise<WithdrawalExecutionOutcome> {
     try {
       const transactionHash = await redeemLiquidity(this.privateKey)
-
-      if (transactionHash) {
-        return true
-      } else {
-        logger.error('Ошибка вывода ликвидности из Sake Finance')
-        return false
-      }
+      return resolveCollectorWithdrawalOutcome('Sake Finance', transactionHash)
     } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const handling = classifySakeWithdrawRuntimeHandling(message)
+      if (handling.skip) {
+        logger.warn(`[Sake] Вывод пропущен: ${handling.message}`)
+        return 'skipped'
+      }
       logger.error('Ошибка вывода из Sake Finance', error)
-      return false
+      return 'failed'
     }
   }
 
   /**
    * Вывести ликвидность из Untitled Bank
    */
-  async withdrawFromUntitledBank (): Promise<boolean> {
+  async withdrawFromUntitledBank (): Promise<WithdrawalExecutionOutcome> {
     try {
       const transactionHash = await withdrawFromUntitledBank(this.privateKey)
-
-      if (transactionHash) {
-        return true
-      } else {
-        logger.error('Ошибка вывода ликвидности из Untitled Bank')
-        return false
-      }
+      return resolveCollectorWithdrawalOutcome('Untitled Bank', transactionHash)
     } catch (error) {
       logger.error('Ошибка вывода из Untitled Bank', error)
-      return false
+      return 'failed'
     }
   }
 

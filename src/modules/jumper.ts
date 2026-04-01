@@ -1,6 +1,5 @@
 import { formatEther, parseEther } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
-import { ProxyManager } from '../proxy-manager.js'
 import { rpcManager, soneiumChain } from '../rpc-manager.js'
 import { safeSendTransaction } from '../transaction-utils.js'
 import { logger } from '../logger.js'
@@ -85,14 +84,45 @@ const TOKENS = {
   USDC_e: '0xbA9986D2381edf1DA03B0B9c1f8b00dc4AacC369'
 } as const
 
+export function shouldSimulateQuoteTransaction (fromToken: string): boolean {
+  return fromToken.toLowerCase() === TOKENS.ETH
+}
+
+export function formatLiFiAxiosError (error: {
+  message?: string
+  response?: {
+    status?: number
+    statusText?: string
+    data?: unknown
+  }
+}): string {
+  const statusParts = [error.response?.status, error.response?.statusText]
+    .filter(part => part !== undefined && part !== null && part !== '')
+    .join(' ')
+  const baseMessage = statusParts || error.message || 'Неизвестная ошибка'
+
+  if (error.response?.data === undefined) {
+    return `LI.FI API ошибка: ${baseMessage}`
+  }
+
+  const details = typeof error.response.data === 'string'
+    ? error.response.data
+    : JSON.stringify(error.response.data)
+
+  return details
+    ? `LI.FI API ошибка: ${baseMessage} | ${details}`
+    : `LI.FI API ошибка: ${baseMessage}`
+}
+
 // LI.FI API конфигурация
 const LI_FI_API_BASE = 'https://li.quest/v1'
 const LI_FI_API_KEY = 'aeaa4f26-c3c3-4b71-aad3-50bd82faf815.1e83cb78-2d75-412d-a310-57272fd0e622'
 
 // Простой rate limiter для LI.FI API
+// API ключ дает 100 RPM = 1 запрос каждые 600ms
 class RateLimiter {
   private static lastRequestTime = 0
-  private static readonly MIN_INTERVAL = 300 // 300ms между запросами (максимум 200 RPM)
+  private static readonly MIN_INTERVAL = 600 // 600ms между запросами (100 RPM)
 
   static async waitIfNeeded (): Promise<void> {
     const now = Date.now()
@@ -112,7 +142,6 @@ export class SoneiumSwap {
   private client: ReturnType<typeof rpcManager.createPublicClient>
   private account: ReturnType<typeof privateKeyToAccount>
   private walletClient: ReturnType<typeof rpcManager.createWalletClient>
-  private proxyManager: ProxyManager
   private customPercentage: number | undefined
   private wheelXSwap: WheelXSwap
 
@@ -127,9 +156,6 @@ export class SoneiumSwap {
 
     // Сохраняем кастомный процент
     this.customPercentage = customPercentage
-
-    // Инициализируем прокси менеджер
-    this.proxyManager = ProxyManager.getInstance()
 
     try {
       // Создаем аккаунт из приватного ключа
@@ -179,27 +205,17 @@ export class SoneiumSwap {
   }
 
   /**
-   * Создать axios instance с рабочим прокси
+   * Создать axios instance для LI.FI API
+   * Прокси не используются - API ключ дает 100 RPM (12,000 запросов за 2 часа)
    */
-  private async createAxiosInstance (): Promise<{
-    axiosInstance: import('axios').AxiosInstance
-    proxy: import('../proxy-manager.js').ProxyConfig
-  }> {
-    const workingProxy = await this.proxyManager.getWorkingProxy()
-    const proxyAgents = this.proxyManager.createProxyAgents(workingProxy)
-
-    return {
-      proxy: workingProxy,
-      axiosInstance: axios.create({
-        headers: {
-          'x-lifi-api-key': LI_FI_API_KEY,
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        },
-        httpsAgent: proxyAgents.httpsAgent,
-        httpAgent: proxyAgents.httpAgent,
-        timeout: 30000
-      })
-    }
+  private createAxiosInstance (): import('axios').AxiosInstance {
+    return axios.create({
+      headers: {
+        'x-lifi-api-key': LI_FI_API_KEY,
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+      },
+      timeout: 30000
+    })
   }
 
   /**
@@ -220,45 +236,38 @@ export class SoneiumSwap {
       integrator: LI_FI_CONFIG.INTEGRATOR,
       fee: LI_FI_CONFIG.FEE_PERCENTAGE
     })
-    let proxy: import('../proxy-manager.js').ProxyConfig | null = null
 
     try {
       // Применяем rate limiting
       await RateLimiter.waitIfNeeded()
 
-      // Создаем axios instance с рабочим прокси
-      const axiosContext = await this.createAxiosInstance()
-      const axiosInstance = axiosContext.axiosInstance
-      proxy = axiosContext.proxy
+      // Создаем axios instance
+      const axiosInstance = this.createAxiosInstance()
 
       // Запрос к LI.FI API
       const response = await axiosInstance.get(`${LI_FI_API_BASE}/quote?${params}`)
 
       const quote = response.data
-      if (quote.transactionRequest) {
+      if (quote.transactionRequest && shouldSimulateQuoteTransaction(fromToken)) {
         const simulation = await this.simulateTransaction(quote.transactionRequest)
 
         if (!simulation.success) {
-          logger.warn(`Симуляция LI.FI неудачна: ${simulation.error}, fallback на Uniswap V2`)
-
-          // Выбрасываем ошибку для переключения на fallback
-          throw new Error(`Симуляция LI.FI неудачна: ${simulation.error}`)
+          logger.warn(`Симуляция LI.FI неудачна: ${simulation.error}`)
+          // Не блокируем котировку - симуляция может давать false negative
+          // Если транзакция реально не пройдет, она откатится при отправке
         }
       }
 
       return quote
     } catch (error) {
-      // Fallback на Uniswap V2 при любой ошибке LI.FI (включая неудачную симуляцию)
-      const isSimulationError = error instanceof Error && error.message.includes('Симуляция LI.FI неудачна')
-      const isProxyAuthError = this.proxyManager.isProxyAuthError(error)
-
-      if (proxy && isProxyAuthError) {
-        this.proxyManager.markProxyAsUnhealthy(proxy)
+      // Логируем детали ошибки для диагностики
+      if (axios.isAxiosError(error)) {
+        logger.error(formatLiFiAxiosError(error))
+      } else if (error instanceof Error) {
+        logger.error(`LI.FI ошибка: ${error.message}`)
       }
 
-      if (!isSimulationError && !isProxyAuthError) {
-        logger.warn('Ошибка LI.FI API, fallback на Uniswap V2')
-      }
+      logger.warn('Ошибка LI.FI API, fallback на Uniswap V2')
 
       try {
         const wheelXQuote = await this.wheelXSwap.getQuote(
@@ -274,7 +283,7 @@ export class SoneiumSwap {
       } catch (wheelXError) {
         // Если и Uniswap V2 не работает, показываем обе ошибки
         const lifiError = axios.isAxiosError(error)
-          ? `LI.FI: ${error.response?.status} ${error.response?.statusText}`
+          ? formatLiFiAxiosError(error)
           : error instanceof Error
             ? error.message
             : 'Неизвестная ошибка'
@@ -367,7 +376,7 @@ export class SoneiumSwap {
       // Выполняем симуляцию с таймаутом
       const simulationPromise = this.client.call(callParams)
       const timeoutPromise = new Promise<never>((_, reject) => {
-        setTimeout(() => reject(new Error('Таймаут симуляции транзакции (10 секунд)')), 10000)
+        setTimeout(() => reject(new Error('Таймаут симуляции транзакции (30 секунд)')), 30000)
       })
 
       try {
@@ -391,7 +400,6 @@ export class SoneiumSwap {
           }
         }
 
-        logger.warn(`Симуляция LI.FI неудачна: ${errorMessage}`)
         return {
           success: false,
           error: errorMessage
@@ -460,15 +468,15 @@ export class SoneiumSwap {
       }
 
       const hash = txResult.hash
-      logger.transaction(hash, 'sent', 'JUMPER')
+      logger.transaction(hash, 'sent', 'JUMPER', 'SWAP')
 
       // Ждем подтверждения транзакции
       const receipt = await this.client.waitForTransactionReceipt({ hash })
 
       if (receipt.status === 'success') {
-        logger.transaction(hash, 'confirmed', 'JUMPER', this.account.address)
+        logger.transaction(hash, 'confirmed', 'JUMPER', this.account.address, 'SWAP')
       } else {
-        logger.transaction(hash, 'failed', 'JUMPER', this.account.address)
+        logger.transaction(hash, 'failed', 'JUMPER', this.account.address, 'SWAP')
       }
 
       if (receipt.status === 'success') {

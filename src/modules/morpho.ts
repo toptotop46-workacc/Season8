@@ -1,8 +1,7 @@
 import { formatUnits, parseUnits } from 'viem'
 import { privateKeyToAccount } from 'viem/accounts'
-import { ensureUSDCBalance } from '../usdc-balance-manager.js'
 import { rpcManager, soneiumChain } from '../rpc-manager.js'
-import { safeWriteContract } from '../transaction-utils.js'
+import { safeWriteContractWithoutSimulation } from '../transaction-utils.js'
 import { logger } from '../logger.js'
 
 // Адреса контрактов Morpho
@@ -56,6 +55,16 @@ const ERC20_ABI = [
 
 // ABI для MetaMorphoV1_1 контракта (основные функции)
 const METAMORPHO_ABI = [
+  {
+    'inputs': [],
+    'name': 'NotEnoughLiquidity',
+    'type': 'error'
+  },
+  {
+    'inputs': [],
+    'name': 'MaxRedeemExceeded',
+    'type': 'error'
+  },
   {
     'inputs': [
       { 'internalType': 'uint256', 'name': 'assets', 'type': 'uint256' },
@@ -120,6 +129,27 @@ const METAMORPHO_ABI = [
 
 // Создание публичного клиента
 const publicClient = rpcManager.createPublicClient(soneiumChain)
+const MORPHO_RECEIPT_TIMEOUT_MS = 300000
+
+export function isMorphoReceiptTimeoutError (message: string): boolean {
+  return message.includes('Timed out while waiting for transaction') ||
+    message.includes('to be confirmed') ||
+    message.includes('TransactionReceiptNotFoundError')
+}
+
+export function isMorphoNotEnoughLiquidityError (message: string): boolean {
+  return message.includes('NotEnoughLiquidity') || message.includes('0x4323a555')
+}
+
+export async function waitForMorphoTransactionReceipt (
+  client: Pick<typeof publicClient, 'waitForTransactionReceipt'>,
+  hash: `0x${string}`
+): Promise<Awaited<ReturnType<typeof publicClient.waitForTransactionReceipt>>> {
+  return await client.waitForTransactionReceipt({
+    hash,
+    timeout: MORPHO_RECEIPT_TIMEOUT_MS
+  })
+}
 
 /**
  * Получает баланс USDC.e токена для указанного адреса
@@ -141,7 +171,6 @@ export async function getUSDCBalance (address: `0x${string}`): Promise<string> {
 
     return formatUnits(balance, decimals)
   } catch (error) {
-    logger.error('Ошибка при получении баланса USDC.e', error)
     throw error
   }
 }
@@ -166,7 +195,6 @@ export async function getMorphoBalance (address: `0x${string}`): Promise<string>
 
     return formatUnits(balance, decimals)
   } catch (error) {
-    logger.error('Ошибка при получении баланса токенов ликвидности Morpho', error)
     throw error
   }
 }
@@ -238,8 +266,8 @@ export async function approveUSDC (privateKey: `0x${string}`, amount: string): P
 
     const gasLimit = BigInt(Math.floor(Number(estimatedGas) * 1.5))
 
-    // Отправляем транзакцию с безопасной отправкой
-    const txResult = await safeWriteContract(
+    // Отправляем транзакцию БЕЗ симуляции (для Morpho)
+    const txResult = await safeWriteContractWithoutSimulation(
       publicClient,
       walletClient,
       account.address,
@@ -259,14 +287,16 @@ export async function approveUSDC (privateKey: `0x${string}`, amount: string): P
     }
 
     const hash = txResult.hash
+    logger.transaction(hash, 'sent', 'MORPHO', 'APPROVE')
 
     // Ожидаем подтверждения
-    const receipt = await publicClient.waitForTransactionReceipt({ hash })
+    const receipt = await waitForMorphoTransactionReceipt(publicClient, hash)
 
     if (receipt.status === 'success') {
-      logger.transaction(hash, 'confirmed', 'MORPHO', account.address)
+      logger.transaction(hash, 'confirmed', 'MORPHO', account.address, 'APPROVE')
       await new Promise(resolve => setTimeout(resolve, 30000))
     } else {
+      logger.transaction(hash, 'failed', 'MORPHO', 'APPROVE')
       throw new Error('Approve transaction failed')
     }
 
@@ -312,8 +342,8 @@ export async function deposit (privateKey: `0x${string}`, amount: string): Promi
 
       const gasLimit = BigInt(Math.floor(Number(estimatedGas) * 1.5))
 
-      // Отправляем транзакцию с безопасной отправкой
-      const txResult = await safeWriteContract(
+      // Отправляем транзакцию БЕЗ симуляции (для Morpho)
+      const txResult = await safeWriteContractWithoutSimulation(
         publicClient,
         walletClient,
         account.address,
@@ -333,16 +363,17 @@ export async function deposit (privateKey: `0x${string}`, amount: string): Promi
       }
 
       hash = txResult.hash
+      logger.transaction(hash, 'sent', 'MORPHO', 'DEPOSIT')
 
       // Ожидаем подтверждения
-      receipt = await publicClient.waitForTransactionReceipt({ hash })
+      receipt = await waitForMorphoTransactionReceipt(publicClient, hash)
     } catch (error) {
       // Если ошибка связана с газом, пробуем с еще большим лимитом
       if (error instanceof Error && error.message.includes('gas')) {
         logger.warn('Ошибка газа, пробуем с увеличенным лимитом...')
 
-        // Retry с безопасной отправкой
-        const retryResult = await safeWriteContract(
+        // Retry БЕЗ симуляции
+        const retryResult = await safeWriteContractWithoutSimulation(
           publicClient,
           walletClient,
           account.address,
@@ -362,14 +393,18 @@ export async function deposit (privateKey: `0x${string}`, amount: string): Promi
         }
 
         hash = retryResult.hash
-        receipt = await publicClient.waitForTransactionReceipt({ hash })
+        logger.transaction(hash, 'sent', 'MORPHO', 'DEPOSIT')
+        receipt = await waitForMorphoTransactionReceipt(publicClient, hash)
       } else {
         throw error
       }
     }
 
     if (receipt.status === 'success') {
+      logger.transaction(hash, 'confirmed', 'MORPHO', account.address, 'DEPOSIT')
       await new Promise(resolve => setTimeout(resolve, 30000))
+    } else {
+      logger.transaction(hash, 'failed', 'MORPHO', 'DEPOSIT')
     }
 
     return hash
@@ -383,103 +418,68 @@ export async function deposit (privateKey: `0x${string}`, amount: string): Promi
  * Выводит ликвидность (redeem) из Morpho
  */
 export async function redeem (privateKey: `0x${string}`, amount: string | null = null): Promise<string> {
-  try {
-    const account = privateKeyToAccount(privateKey)
+  const account = privateKeyToAccount(privateKey)
+  const walletClient = rpcManager.createWalletClient(soneiumChain, account)
 
-    const walletClient = rpcManager.createWalletClient(soneiumChain, account)
+  const balanceRaw = await publicClient.readContract({
+    address: METAMORPHO_CONTRACT,
+    abi: METAMORPHO_ABI,
+    functionName: 'balanceOf',
+    args: [account.address]
+  })
 
-    // Получаем текущий баланс токенов ликвидности
-    const morphoBalance = await getMorphoBalance(account.address)
+  if (balanceRaw === 0n) {
+    throw new Error('Нет токенов ликвидности для вывода')
+  }
 
-    if (parseFloat(morphoBalance) === 0) {
-      throw new Error('Нет токенов ликвидности для вывода')
-    }
+  const decimals = await publicClient.readContract({
+    address: METAMORPHO_CONTRACT,
+    abi: METAMORPHO_ABI,
+    functionName: 'decimals'
+  })
 
-    // Определяем количество для вывода
-    const redeemAmount = amount || morphoBalance
-    if (parseFloat(redeemAmount) > parseFloat(morphoBalance)) {
+  let amountWei: bigint
+  if (amount !== null) {
+    amountWei = parseUnits(amount, decimals)
+    if (amountWei > balanceRaw) {
       throw new Error('Недостаточно токенов ликвидности для указанной суммы')
     }
+  } else {
+    amountWei = balanceRaw
+  }
 
-    const decimals = await publicClient.readContract({
+  // Отправляем транзакцию БЕЗ симуляции (simulateContract дает false negative для Morpho)
+  // gas не указываем — viem автоматически оценивает через eth_estimateGas (EIP-1559)
+  const txResult = await safeWriteContractWithoutSimulation(
+    publicClient,
+    walletClient,
+    account.address,
+    {
+      chain: soneiumChain,
+      account: account,
       address: METAMORPHO_CONTRACT,
       abi: METAMORPHO_ABI,
-      functionName: 'decimals'
-    })
-
-    const amountWei = parseUnits(redeemAmount, decimals)
-
-    // Выводим ликвидность
-
-    // Выводим ликвидность с увеличенным лимитом газа
-    let hash: `0x${string}`
-    let receipt: Awaited<ReturnType<typeof publicClient.waitForTransactionReceipt>>
-
-    try {
-      // Отправляем транзакцию с безопасной отправкой
-      const txResult = await safeWriteContract(
-        publicClient,
-        walletClient,
-        account.address,
-        {
-          chain: soneiumChain,
-          account: account,
-          address: METAMORPHO_CONTRACT,
-          abi: METAMORPHO_ABI,
-          functionName: 'redeem',
-          args: [amountWei, account.address, account.address], // shares, receiver, owner
-          gas: 500000n // Увеличенный лимит газа для сложной операции Morpho
-        }
-      )
-
-      if (!txResult.success) {
-        throw new Error(txResult.error || 'Ошибка отправки транзакции')
-      }
-
-      hash = txResult.hash
-
-      // Ожидаем подтверждения
-      receipt = await publicClient.waitForTransactionReceipt({ hash })
-    } catch (error) {
-      // Если ошибка связана с газом, пробуем с еще большим лимитом
-      if (error instanceof Error && error.message.includes('gas')) {
-        logger.warn('Ошибка газа, пробуем с увеличенным лимитом...')
-
-        // Retry с безопасной отправкой
-        const retryResult = await safeWriteContract(
-          publicClient,
-          walletClient,
-          account.address,
-          {
-            chain: soneiumChain,
-            account: account,
-            address: METAMORPHO_CONTRACT,
-            abi: METAMORPHO_ABI,
-            functionName: 'redeem',
-            args: [amountWei, account.address, account.address],
-            gas: 800000n // Еще больший лимит газа
-          }
-        )
-
-        if (!retryResult.success) {
-          throw new Error(retryResult.error || 'Ошибка retry транзакции')
-        }
-
-        hash = retryResult.hash
-        receipt = await publicClient.waitForTransactionReceipt({ hash })
-      } else {
-        throw error
-      }
+      functionName: 'redeem',
+      args: [amountWei, account.address, account.address] // shares, receiver, owner
     }
+  )
 
-    if (receipt.status === 'success') {
-      await new Promise(resolve => setTimeout(resolve, 30000))
-    }
+  if (!txResult.success) {
+    throw new Error(txResult.error || 'Ошибка отправки транзакции')
+  }
 
+  const hash = txResult.hash
+  logger.transaction(hash, 'sent', 'MORPHO', 'REDEEM')
+
+  const receipt = await waitForMorphoTransactionReceipt(publicClient, hash)
+
+  if (receipt.status === 'success') {
+    logger.transaction(hash, 'confirmed', 'MORPHO', account.address, 'REDEEM')
+    await new Promise(resolve => setTimeout(resolve, 30000))
     return hash
-  } catch (error) {
-    logger.error('Ошибка при выводе ликвидности', error)
-    throw error
+  } else {
+    logger.transaction(hash, 'failed', 'MORPHO', 'REDEEM')
+    throw new Error(`REDEEM TX reverted: ${hash}`)
   }
 }
 
@@ -550,95 +550,59 @@ export async function getMorphoTotalAssets (): Promise<string> {
 export async function displayLiquidityInfo (_userAddress: `0x${string}`, _operation: string, _amount: string, _transactionHash: string): Promise<void> {}
 
 /**
- * Полный процесс управления ликвидностью Morpho с проверками
+ * Вывод ликвидности из Morpho (withdrawal-only режим, депозиты отключены)
  */
-export async function performMorphoLiquidityManagement (privateKey: `0x${string}`, amount: string | null = null): Promise<{
+export async function performMorphoLiquidityManagement (privateKey: `0x${string}`): Promise<{
   success: boolean
   walletAddress?: string
-  usdcBalance?: string
   morphoBalance?: string
-  depositAmount?: string
-  depositTransactionHash?: string
   withdrawTransactionHash?: string | null
   explorerUrl?: string
-  usdcPurchased?: boolean
-  usdcPurchaseHash?: string | undefined
-  usdcPurchaseAmount?: string | undefined
+  skipped?: boolean
+  reason?: string
   error?: string
 }> {
   try {
     const account = privateKeyToAccount(privateKey)
     logger.info(`[Morpho] Кошелек: ${account.address}`)
 
-    // 1. Проверяем текущую ликвидность (токены ликвидности)
     const morphoBalance = await getMorphoBalance(account.address)
 
-    // 2. Если есть токены ликвидности, выводим их
-    if (parseFloat(morphoBalance) > 0) {
-      logger.info('[Morpho] Обнаружена ликвидность, вывод...')
-      const withdrawTxHash = await redeem(privateKey)
-
-      // Выводим информацию после вывода
-      await displayLiquidityInfo(account.address, 'redeem', morphoBalance, withdrawTxHash)
-
+    if (parseFloat(morphoBalance) === 0) {
+      logger.info('[Morpho] Нет ликвидности для вывода')
       return {
         success: true,
+        skipped: true,
+        reason: 'Нет ликвидности для вывода',
         walletAddress: account.address,
-        morphoBalance: morphoBalance,
-        withdrawTransactionHash: withdrawTxHash,
-        explorerUrl: `https://soneium.blockscout.com/tx/${withdrawTxHash}`
-      }
-    } else {
-      // 3. Проверяем и обеспечиваем наличие USDC.e для депозита
-      const usdcBalanceResult = await ensureUSDCBalance(privateKey, '0.0001')
-
-      if (!usdcBalanceResult.success) {
-        throw new Error(`Не удалось обеспечить наличие USDC.e: ${usdcBalanceResult.error}`)
-      }
-
-      const usdcBalance = usdcBalanceResult.usdcBalance
-
-      // 4. Определяем количество для депозита
-      const depositAmount = amount || usdcBalance
-      if (parseFloat(depositAmount) > parseFloat(usdcBalance)) {
-        throw new Error('Недостаточно USDC.e на балансе для указанной суммы')
-      }
-
-      logger.info(`[Morpho] Депозит: ${depositAmount} USDC.e`)
-
-      // 5. Проверяем allowance
-      const hasAllowance = await checkAllowance(account.address, depositAmount)
-
-      // 6. Если нужно, выполняем approve
-      if (!hasAllowance) {
-        await approveUSDC(privateKey, depositAmount)
-      }
-
-      // 7. Добавляем ликвидность
-      const depositTxHash = await deposit(privateKey, depositAmount)
-
-      // 8. Выводим детальную информацию после депозита
-      await displayLiquidityInfo(account.address, 'deposit', depositAmount, depositTxHash)
-
-      return {
-        success: true,
-        walletAddress: account.address,
-        usdcBalance: usdcBalance,
-        morphoBalance: morphoBalance,
-        depositAmount: depositAmount,
-        depositTransactionHash: depositTxHash,
-        explorerUrl: `https://soneium.blockscout.com/tx/${depositTxHash}`,
-        usdcPurchased: usdcBalanceResult.purchased || false,
-        usdcPurchaseHash: usdcBalanceResult.purchaseHash || undefined,
-        usdcPurchaseAmount: usdcBalanceResult.purchaseAmount || undefined
+        morphoBalance: '0'
       }
     }
 
+    logger.info('[Morpho] Обнаружена ликвидность, вывод...')
+    const withdrawTxHash = await redeem(privateKey)
+
+    return {
+      success: true,
+      walletAddress: account.address,
+      morphoBalance: morphoBalance,
+      withdrawTransactionHash: withdrawTxHash,
+      explorerUrl: `https://soneium.blockscout.com/tx/${withdrawTxHash}`
+    }
+
   } catch (error) {
-    logger.error('Ошибка при управлении ликвидностью Morpho', error)
+    const errorMessage = error instanceof Error ? error.message : String(error)
+    if (isMorphoNotEnoughLiquidityError(errorMessage)) {
+      logger.warn('[Morpho] Недостаточно ликвидности в vault для вывода — заёмщики ещё не вернули средства, попробуйте позже')
+      return { success: true, skipped: true, reason: 'NotEnoughLiquidity' }
+    } else if (isMorphoReceiptTimeoutError(errorMessage)) {
+      logger.error('Ошибка при выводе Morpho: подтверждение транзакции не получено вовремя', error)
+    } else {
+      logger.error('Ошибка при выводе Morpho', error)
+    }
     return {
       success: false,
-      error: error instanceof Error ? error.message : 'Неизвестная ошибка'
+      error: errorMessage
     }
   }
 }

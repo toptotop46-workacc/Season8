@@ -1,8 +1,13 @@
 import { isHash, isHex, keccak256, type PublicClient, type WalletClient } from 'viem'
 import { logger } from './logger.js'
-import { SIMULATE_BEFORE_SEND } from './season-config.js'
+import { SIMULATE_BEFORE_SEND, STRICT_SIMULATION } from './season-config.js'
 
-const SIMULATION_TIMEOUT_MS = 15000
+const SIMULATION_TIMEOUT_MS = 30000
+
+export interface SafeWriteContractOptions {
+  allowSimulationFailure?: boolean
+  simulationFailureContext?: string
+}
 
 interface NormalizedTransactionIdentifier {
   hash?: `0x${string}`
@@ -151,6 +156,15 @@ export interface TransactionSafetyCheck {
   warnings: string[]
 }
 
+export function shouldBypassFailedSimulationInStrictMode (params: {
+  strictSimulation: boolean
+  allowSimulationFailure?: boolean
+}): boolean {
+  const { strictSimulation, allowSimulationFailure = false } = params
+
+  return strictSimulation && allowSimulationFailure
+}
+
 /**
  * Проверяет безопасность отправки транзакции
  */
@@ -266,11 +280,14 @@ export async function safeSendTransaction (
         const sim = await simulateSendTransaction(publicClient, accountAddress, transactionParams)
         if (!sim.success) {
           logger.warn(`Симуляция неудачна: ${sim.error}`)
-          return {
-            hash: '0x' as `0x${string}`,
-            success: false,
-            error: `Симуляция: ${sim.error}`
+          if (STRICT_SIMULATION) {
+            return {
+              hash: '0x' as `0x${string}`,
+              success: false,
+              error: `Симуляция: ${sim.error}`
+            }
           }
+          logger.warn('Продолжаем отправку несмотря на ошибку симуляции (STRICT_SIMULATION=false)')
         }
       }
 
@@ -324,10 +341,18 @@ export async function safeSendTransaction (
       if (errorMessage.includes('nonce') || errorMessage.includes('replacement')) {
         await new Promise(resolve => setTimeout(resolve, 30000))
         continue
-      } else {
-        // Для других ошибок логируем полную информацию
-        logger.error(`Ошибка попытки ${attempt}: ${errorMessage}`)
       }
+
+      // Contract revert детерминирован — повторные попытки бессмысленны
+      if (errorMessage.includes('reverted') || errorMessage.includes('revert')) {
+        return {
+          hash: '0x' as `0x${string}`,
+          success: false,
+          error: errorMessage
+        }
+      }
+
+      logger.error(`Ошибка попытки ${attempt}: ${errorMessage}`)
 
       if (attempt === maxRetries) {
         return {
@@ -337,7 +362,107 @@ export async function safeSendTransaction (
         }
       }
 
-      // Ждем перед следующей попыткой
+      await new Promise(resolve => setTimeout(resolve, 15000))
+    }
+  }
+
+  return {
+    hash: '0x' as `0x${string}`,
+    success: false,
+    error: 'Исчерпаны все попытки'
+  }
+}
+
+/**
+ * Безопасная отправка writeContract с проверкой nonce (БЕЗ симуляции)
+ * Используется для контрактов, где simulateContract дает false negative
+ */
+export async function safeWriteContractWithoutSimulation (
+  publicClient: PublicClient,
+  walletClient: WalletClient,
+  accountAddress: `0x${string}`,
+  contractParams: Record<string, unknown>,
+  maxRetries: number = 3
+): Promise<{ hash: `0x${string}`; success: boolean; error?: string }> {
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // Пропускаем симуляцию - отправляем транзакцию напрямую
+
+      const safetyCheck = await checkTransactionSafety(publicClient, walletClient, accountAddress)
+
+      if (!safetyCheck.canProceed) {
+        const waited = await waitForPendingTransactions(publicClient, accountAddress)
+
+        if (!waited) {
+          if (attempt === maxRetries) {
+            return {
+              hash: '0x' as `0x${string}`,
+              success: false,
+              error: 'Не удалось дождаться завершения pending транзакций'
+            }
+          }
+          continue
+        }
+      }
+
+      const finalNonceCheck = await publicClient.getTransactionCount({
+        address: accountAddress,
+        blockTag: 'pending'
+      })
+
+      if (finalNonceCheck !== safetyCheck.recommendedNonce) {
+        safetyCheck.recommendedNonce = finalNonceCheck
+      }
+
+      const returnedIdentifier = await walletClient.writeContract({
+        ...contractParams,
+        nonce: safetyCheck.recommendedNonce
+      } as Parameters<typeof walletClient.writeContract>[0])
+
+      const normalized = normalizeTransactionIdentifier(returnedIdentifier, 'safeWriteContractWithoutSimulation')
+      if (!normalized.hash) {
+        return {
+          hash: '0x' as `0x${string}`,
+          success: false,
+          error: 'RPC вернул некорректный идентификатор транзакции'
+        }
+      }
+
+      return { hash: normalized.hash, success: true }
+
+    } catch (error) {
+      const errorMessage = error instanceof Error ? error.message : 'Неизвестная ошибка'
+      const extractedHash = extractHashFromError(error, errorMessage, 'safeWriteContractWithoutSimulation')
+
+      if (extractedHash) {
+        return { hash: extractedHash, success: true }
+      }
+
+      if (errorMessage.includes('nonce') || errorMessage.includes('replacement')) {
+        await new Promise(resolve => setTimeout(resolve, 30000))
+        continue
+      }
+
+      // Contract revert детерминирован — повторные попытки бессмысленны
+      if (errorMessage.includes('reverted') || errorMessage.includes('revert')) {
+        return {
+          hash: '0x' as `0x${string}`,
+          success: false,
+          error: errorMessage
+        }
+      }
+
+      logger.error(`Ошибка попытки ${attempt}: ${errorMessage}`)
+
+      if (attempt === maxRetries) {
+        return {
+          hash: '0x' as `0x${string}`,
+          success: false,
+          error: errorMessage
+        }
+      }
+
       await new Promise(resolve => setTimeout(resolve, 15000))
     }
   }
@@ -357,8 +482,10 @@ export async function safeWriteContract (
   walletClient: WalletClient,
   accountAddress: `0x${string}`,
   contractParams: Record<string, unknown>,
-  maxRetries: number = 3
+  maxRetries: number = 3,
+  options: SafeWriteContractOptions = {}
 ): Promise<{ hash: `0x${string}`; success: boolean; error?: string }> {
+  const { allowSimulationFailure = false, simulationFailureContext } = options
 
   for (let attempt = 1; attempt <= maxRetries; attempt++) {
     try {
@@ -366,11 +493,22 @@ export async function safeWriteContract (
         const sim = await simulateWriteContract(publicClient, accountAddress, contractParams)
         if (!sim.success) {
           logger.warn(`Симуляция неудачна: ${sim.error}`)
-          return {
-            hash: '0x' as `0x${string}`,
-            success: false,
-            error: `Симуляция: ${sim.error}`
+          if (shouldBypassFailedSimulationInStrictMode({
+            strictSimulation: STRICT_SIMULATION,
+            allowSimulationFailure
+          })) {
+            logger.warn(
+              simulationFailureContext ??
+              'Продолжаем отправку несмотря на ошибку симуляции (verified fallback policy)'
+            )
+          } else if (STRICT_SIMULATION) {
+            return {
+              hash: '0x' as `0x${string}`,
+              success: false,
+              error: `Симуляция: ${sim.error}`
+            }
           }
+          logger.warn('Продолжаем отправку несмотря на ошибку симуляции (STRICT_SIMULATION=false)')
         }
       }
 

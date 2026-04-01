@@ -22,7 +22,6 @@
     "stargate": "tsx src/run-module.ts stargate",
     "untitled-bank": "tsx src/run-module.ts untitled-bank",
     "revoke": "tsx src/run-module.ts revoke",
-    "redbutton-noob": "tsx src/run-module.ts redbutton-noob",
     "harkan": "tsx src/run-module.ts harkan",
     "velodrome": "tsx src/run-module.ts velodrome",
     "wowmax": "tsx src/run-module.ts wowmax",
@@ -64,7 +63,7 @@
     "node": ">=18.0.0"
   },
   "overrides": {
-    "glob": "^11.1.0",
+    "glob": "^13.0.6",
     "rimraf": "^6.1.0",
     "lodash.isequal": "npm:fast-deep-equal@^3.1.3",
     "unzipper": "^0.12.3",
